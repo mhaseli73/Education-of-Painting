@@ -1,0 +1,87 @@
+name: Painting Lessons Video AI Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 15 * * *" # Every day at 15:00 UTC (18:30 Iran Time). Different from the other channel, so both do not use the image service at the same time
+
+permissions:
+  contents: write
+
+concurrency:
+  group: painting-video-pipeline
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # ffmpeg for video encoding, fonts for the title and thumbnail text.
+      # ImageMagick and the Microsoft fonts are no longer needed: the text is drawn with Pillow.
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-dejavu-core fonts-liberation
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Fails in seconds (not after 40 minutes) when the YouTube token is expired or revoked.
+      - name: Check YouTube login
+        run: python -c "import youtube_uploader; youtube_uploader.check_credentials()"
+        env:
+          YT_TOKEN_JSON: ${{ secrets.YT_TOKEN_JSON }}
+
+      # No "clean output" step here: pipeline.py cleans old files itself when it starts a NEW run,
+      # and keeps the files when it RESUMES after a failed attempt.
+      # nick-invision/retry@v2 is old; nick-fields/retry@v3 is the maintained version.
+      - name: Run AI pipeline
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 120
+          max_attempts: 3
+          retry_on: error
+          command: python pipeline.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_TOKEN_JSON: ${{ secrets.YT_TOKEN_JSON }}
+          POLLINATIONS_API_KEY: ${{ secrets.POLLINATIONS_API_KEY }}  # removes the logo from images
+          # YT_PRIVACY_STATUS: public   # uncomment (private | unlisted | public). Default is private.
+          # CHANNEL_NAME: My Painting Channel   # name used in prompts and on the title screen
+          # IMAGE_STYLE: illustration   # default is realistic photos
+
+      - name: Save AI decision history
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f output/decision_history.json
+          if git diff --cached --quiet; then
+            echo "No history changes"
+          else
+            git commit -m "Update AI decision history"
+            git pull --rebase
+            git push
+          fi
+
+      # always(): keep the files also when the run failed, so you can see what went wrong
+      - name: Save generated files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: painting-video-output
+          path: output/
+          retention-days: 3
+          if-no-files-found: warn
